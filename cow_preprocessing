@@ -1,0 +1,94 @@
+library(tidyverse)
+library(janitor)
+library(roams)
+library(glue)
+library(lubridate)
+library(sf)
+library(purrr)
+library(tidyr)
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::between)
+conflicts_prefer(dplyr::first)
+
+cows_raw = read_csv("export_UQ_GPS.csv") ## data provided by the University of Queensland
+cows_raw = cows_raw |> 
+  janitor::clean_names() |> 
+  mutate(animal = str_sub(tag_id, -4, -1),
+         date = as.Date(timestamp),
+         dtime = c(NA, diff(timestamp))
+  )
+
+cows <- cows_raw |>
+  rename(latitude = longitude, longitude = latitude) |>   ## headers appear to be swapped in the import
+  mutate(timestamp = as.POSIXct(timestamp, tz = "UTC")) |>
+  filter(!is.na(latitude), !is.na(longitude),
+         between(latitude, -90, 90), between(longitude, -180, 180),
+         latitude != 0, longitude != 0) |> ## just confirming that latitude and longitude are in the right order
+  arrange(tag_id, timestamp)
+
+step <- 2.38 * 60
+  
+cows_rounded <- cows |>
+  filter(timestamp<=lubridate::ymd_hms("2024-12-01 00:00:00")) |>
+  filter(!animal %in% c("AAD6", "ACD2", "AF9D", "AFEF", "B023", "B028", "AFA5")) |>
+## "AAD6", "ACD2", "AF9D", "AFEF", "B023", "B028" were recorded on 15 minute intervals, "AFA5" only had two days worth of data
+  group_by(animal) |>
+  arrange(timestamp, .by_group = TRUE) |>
+  mutate(
+    t_start = first(timestamp),
+    timestep = as.integer(round(
+      as.numeric(difftime(timestamp, t_start, units = "secs")) / step
+    )),
+    offset = abs(
+      as.numeric(difftime(timestamp, t_start, units = "secs")) -
+        timestep * step
+    )
+  ) |>
+  ungroup()
+
+
+cows_ts <- cows_rounded |>
+  group_by(animal, timestep) |>
+  slice_min(offset, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  as_tsibble(
+    key = animal,
+    index = timestep,
+    regular = TRUE
+  )
+
+cows_complete <- cows_ts |>
+  mutate(observed = TRUE) |>
+  fill_gaps() |>
+  mutate(missing = is.na(observed))
+
+
+cows_coords <- cows_complete |>
+  filter(!missing) |>
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326
+  ) |>
+  st_transform(32756)
+
+coords <- st_coordinates(cows_coords)
+
+cows_coords <- cows_coords |>
+  st_drop_geometry() |>
+  mutate(
+    x = coords[, 1],
+    y = coords[, 2]
+  ) |>
+  select(animal, timestep, x, y)
+
+cows_metres <- cows_complete |>
+  left_join(cows_coords, by = c("animal", "timestep"))
+
+cows_gps <- cows_metres |>
+  arrange(animal, timestep) |>
+  nest(data = c(x, y), .by = animal)  
+
+
+  
+
