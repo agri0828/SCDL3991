@@ -1,0 +1,18 @@
+## data generation for the Aim 1 simulation study
+## parameters were fitted from the ROAMS Soft thresholding implementation on the sheep
+
+library(roams)
+library(tidyverse)
+
+d <- simulate_data_study2(
+  samples      = 40,
+  n            = 2016,
+  phi_coef     = 0.3,
+  sigma2_w_lon = 105,
+  sigma2_w_lat = 114,
+  sigma2_v_lon = 22,
+  sigma2_v_lat = 33,
+  distances    = c(10, 50, 75, 100, 200),
+  seed         = 111
+)
+
