@@ -1,0 +1,345 @@
+library(tidyverse)
+library(arrow)
+library(data.table)
+library(glue)
+library(readxl)
+library(lubridate)
+library(sf)
+
+library(conflicted)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::mutate)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+
+
+## loading in of data and storing as csv
+base_dir    <- "Z:/" ## this is a network path specific to the setup of the RDS for data storage
+feature_dir <- "_gps_features"             
+
+dir.create(feature_dir, showWarnings = FALSE)
+
+farms <- list(
+  FG = list(folder = "Accelerometer data - FG", type = "standard",
+  set1 = "GPS collars- Set 1", set2 = "GPS Collars- Set 2"),
+  IM = list(folder = "Accelerometer data - IM", type = "im"),
+  OS = list(folder = "Accelerometer data - OS", type = "standard",
+            set1 = "Set 1", set2 = "Set 2"),
+  WL = list(folder = "Accelerometer data - WL", type = "standard",
+            set1 = "Set 1", set2 = "Set 2")
+)
+
+read_collar_lookup <- function(collar_file, sheet = NULL) {
+  args <- list(path = collar_file)
+  if (!is.null(sheet)) args$sheet <- sheet
+  do.call(read_xlsx, args) |>
+    rename_with(~ str_trim(.)) |>
+    rename(sd_card   = matches("^SD"),
+           animal_id = `Animal ID`) |>
+    select(sd_card, animal_id) |>
+    mutate(across(everything(), as.character))
+}
+
+process_sd_card_gps <- function(sd_folder_path, sd_card_name, animal_id,
+                                 farm_key, set_label) {
+
+  csv_files <- list.files(sd_folder_path, pattern = "\\.csv$",
+                          full.names = TRUE, recursive = TRUE)
+  if (length(csv_files) == 0) {
+    warning(glue("No CSVs in: {sd_folder_path}"))
+    return(NULL)
+  }
+
+  raw <- map_dfr(csv_files, \(f) {
+    tryCatch({
+      read_csv(f, show_col_types = FALSE, col_types = cols(.default = "c"),
+               locale = locale(encoding = "latin1")) |>
+        dplyr::select(-matches("^0"))
+    }, error = function(e) {
+      warning(glue("Skipping corrupt file: {basename(f)} — {e$message}"))
+      NULL
+    })
+  })
+
+  if (nrow(raw) == 0) return(NULL)
+
+  raw <- raw |>
+    mutate(
+      Lat  = suppressWarnings(as.numeric(Lat)),
+      Long = suppressWarnings(as.numeric(Long)),
+      HDOP = suppressWarnings(as.numeric(HDOP))
+    ) |>
+    filter(!is.na(Lat), !is.na(Long), Lat != 0, Long != 0) ## original data contained accelerometer data that was collected more frequently than GPS.
+
+  if (nrow(raw) == 0) {
+    warning(glue("{sd_folder_path}: no valid GPS fixes (Lat/Long all NA or 0) — skipping"))
+    return(NULL)
+  }
+
+  raw |>
+    mutate(
+      collar_time = as.POSIXct(paste(Date, Time), format = "%d/%m/%y %H:%M:%S")
+    ) |>
+    filter(!is.na(collar_time)) |>
+    arrange(collar_time) |>
+    mutate(
+      farm      = farm_key,
+      animal_id = animal_id,
+      sd_card   = sd_card_name,
+      set       = set_label
+    ) |>
+    select(farm, animal_id, sd_card, set, collar_time, Lat, Long, HDOP)
+}
+
+process_set_gps <- function(set_folder_path, collar_file_name,
+                             farm_key, set_label, sheet = NULL) {
+
+  if (file.exists(collar_file_name)) {
+    collar_file <- collar_file_name
+  } else {
+    collar_file <- file.path(set_folder_path, collar_file_name)
+  }
+
+  if (!file.exists(collar_file)) stop(glue("Collar file not found:\n  {collar_file}"))
+
+  collar_lookup <- read_collar_lookup(collar_file, sheet = sheet)
+
+  sd_folders <- list.dirs(set_folder_path, recursive = FALSE, full.names = TRUE)
+  sd_folders <- sd_folders[!str_detect(basename(sd_folders), "^[._]")]
+
+  if (length(sd_folders) == 0) {
+    warning(glue("No SD card subfolders in: {set_folder_path}"))
+    return(NULL)
+  }
+
+  map_dfr(sd_folders, \(folder) {
+    sd_name <- basename(folder)
+    animal  <- collar_lookup |> filter(sd_card == sd_name) |> pull(animal_id)
+
+    if (length(animal) == 0 || is.na(animal[1])) {
+      warning(glue("  No Animal ID for SD {sd_name} — skipping"))
+      return(NULL)
+    }
+
+    message(glue("    Processing SD card {sd_name} (animal {animal[1]})..."))
+    process_sd_card_gps(folder, sd_name, animal[1], farm_key, set_label)
+  })
+}
+
+
+iwalk(farms, \(farm_info, farm_key) {
+
+  feature_path <- file.path(feature_dir, glue("{farm_key}_gps.parquet"))
+
+  if (file.exists(feature_path)) {
+    message(glue("[{farm_key}] Already processed — skipping (delete .parquet to rerun)"))
+    return()
+  }
+
+  message(glue("[{farm_key}] Processing..."))
+  farm_path <- file.path(base_dir, farm_info$folder)
+
+  if (farm_info$type == "im") {
+
+    collar_file <- list.files(farm_path, pattern = "Set 1 and 2 - Collar numbers",
+                               full.names = TRUE, ignore.case = TRUE)
+    if (length(collar_file) == 0) stop(glue("[IM] No collar xlsx found"))
+
+    set1 <- process_set_gps(file.path(farm_path, "Round 1"),
+                             collar_file[1], farm_key, "Set 1", sheet = "Round 1")
+    set2 <- process_set_gps(file.path(farm_path, "Round 2"),
+                             collar_file[1], farm_key, "Set 2", sheet = "Round 2")
+
+  } else {
+
+    set1_path <- file.path(farm_path, farm_info$set1)
+    set2_path <- file.path(farm_path, farm_info$set2)
+
+    set1 <- process_set_gps(set1_path, "Set 1 - collar numbers.xlsx", farm_key, "Set 1")
+    set2 <- process_set_gps(set2_path, "Set 2 - collar numbers.xlsx", farm_key, "Set 2")
+  }
+
+  combined <- bind_rows(set1, set2) |>
+    arrange(farm, animal_id, sd_card, collar_time)
+
+  write_parquet(combined, feature_path)
+
+  message(glue(
+    "  [{farm_key}] Done | {nrow(combined)} GPS fixes | ",
+    "{n_distinct(combined$animal_id)} animals | ",
+    "saved -> {feature_path}\n"
+  ))
+
+  rm(set1, set2, combined); gc()
+})
+
+
+gps_all <- imap_dfr(farms, \(farm_info, farm_key) {
+  fp <- file.path(feature_dir, glue("{farm_key}_gps.parquet"))
+  if (!file.exists(fp)) { warning(glue("{farm_key} not found")); return(NULL) }
+  read_parquet(fp)
+})
+
+write_csv(gps_all, "gps_all.csv")
+
+## conversion to nz time
+gps_all <- gps_all |>
+  mutate(collar_time_nz = with_tz(collar_time, tzone = "Pacific/Auckland"))
+
+farm_bounds_raw <- st_read(file.path(feature_dir, "FGfarm_boundaries.geojson")) ## defined boundaries from visual inspection
+
+farm_bounds <- farm_bounds_raw |>
+  group_by(farm) |>
+  summarise(geometry = st_union(geometry)) |>
+  ungroup() |>
+  st_make_valid()
+
+## buffer to account for some errors with projections etc.
+farm_bounds_buf <- st_transform(farm_bounds, crs = 2193) |>
+  st_buffer(dist = 20) |>
+  st_make_valid() |>
+  st_transform(crs = 4326)
+
+gps_sf <- gps_all |>
+  st_as_sf(coords = c("Long", "Lat"), crs = 4326, remove = FALSE)
+
+gps_sf <- gps_sf |>
+  st_join(
+    farm_bounds_buf |> dplyr::select(farm_bound = farm, geometry),
+    join = st_within
+  ) |>
+  mutate(in_farm = !is.na(farm_bound) & farm == farm_bound) |>
+  st_drop_geometry()
+
+
+## filter so that first and last observation of each set are in the farm polygon for each farm
+gps_trimmed <- gps_sf |>
+  arrange(animal_id, set, collar_time_nz) |>
+  group_by(animal_id, set) |>
+  mutate(idx = row_number()) |>
+  filter(
+    any(in_farm),
+    idx >= min(idx[in_farm]),
+    idx <= max(idx[in_farm])
+  ) |>
+  select(-idx) |>
+  ungroup()
+
+write_parquet(gps_trimmed, file.path(feature_dir, "gps_all_depot_removed.parquet")) ## save as an intermediary parquet file
+
+
+gps_all = read_parquet(file.path(feature_dir, "gps_all_depot_removed.parquet"))
+
+gps_complete = gps_all |>
+  mutate(collar_time_5min = round_date(collar_time_nz, unit = "5 minutes")) |>
+  arrange(farm, animal_id, collar_time_5min) |>
+  distinct(farm, animal_id, collar_time_5min, .keep_all = TRUE) ## round to nearest 5 minute
+
+gps_complete_sf <- gps_complete |>
+  st_as_sf(coords = c("Long", "Lat"), crs = 4326, remove = FALSE) |>
+  st_transform(2193)
+
+coords_m <- st_coordinates(gps_complete_sf)
+gps_complete <- gps_complete |>
+  mutate(x_m = coords_m[, 1], y_m = coords_m[, 2])
+
+gps_all <- gps_all |>
+  left_join(
+    gps_complete |> select(farm, animal_id, collar_time_5min, x_m, y_m),
+    by = c("farm", "animal_id", "collar_time_5min")
+  )
+
+expand_to_regular_grid <- function(df) {
+  full_seq <- tibble(
+    collar_time_5min = seq(
+      from = min(df$collar_time_5min),
+      to   = max(df$collar_time_5min),
+      by   = "5 mins"
+    )
+  )
+  full_seq |> left_join(df, by = "collar_time_5min")
+} ## this accounts for implicit missingness
+
+
+gps_grouped <- gps_all |>
+  group_by(farm, animal_id) |>
+  arrange(collar_time_5min, .by_group = TRUE) |>
+  nest() |>
+  ungroup() |>
+  mutate(data = map(data, expand_to_regular_grid))
+
+## animals were retained based on the visual inspection of the coverage to have at least 10 days of approximately consecutive observations
+## this typically fell within one of the collar deployment periods (eg. consistent data coverage for the start of one collar deployment and nothing for the other)
+manual_cutoffs <- tribble(
+  ~farm, ~animal_id, ~keep_set, ~cutoff_type, ~cutoff_date,
+
+  "FG", "5",    NA_character_, "after", ymd("2026-02-17"),
+  "FG", "581",  NA_character_, "after", ymd("2026-02-17"),
+  "FG", "622",  NA_character_, "after", ymd("2026-02-17"),   
+
+  "IM", "1125", NA_character_, "after", ymd("2025-12-03"),
+  "IM", "1204", "Set 1", "before", ymd("2025-12-03"),
+
+  "OS", "109",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "167",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "228",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "232",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "263",  "Set 1", "before", ymd("2026-03-02"),
+  "OS", "33",   "Set 2", "after", ymd("2026-03-02"),
+  "OS", "341",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "494",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "599",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "610",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "675",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "705",  "Set 2", "after", ymd("2026-03-02"),
+  "OS", "72",   "Set 2", "after", ymd("2026-03-02"),
+  "WL", "1187", NA_character_, "after", ymd("2026-04-07"),
+  "WL", "1550", "Set 2", NA_character_, as.Date(NA),  
+  "WL", "1474", "Set 1", NA_character_, as.Date(NA), 
+  "WL", "1438", "Set 1", NA_character_, as.Date(NA),
+  "WL", "1440", "Set 2", NA_character_, as.Date(NA),
+  "WL", "1416", "Set 2", NA_character_, as.Date(NA),
+  "WL", "1276", "Set 1", NA_character_, as.Date(NA),
+  "WL", "1152", "Set 1", NA_character_, as.Date(NA)
+) ## filters based on time
+
+apply_manual_cutoff <- function(df, keep_set, cutoff_type, cutoff_date) {
+  out <- df
+
+  if (!is.na(keep_set)) {
+    out <- out |> filter(set == keep_set)
+  }
+
+  if (!is.na(cutoff_type)) {
+    if (cutoff_type == "after") {
+      out <- out |> filter(as.Date(collar_time_5min) >= cutoff_date)
+    } else if (cutoff_type == "before") {
+      out <- out |> filter(as.Date(collar_time_5min) < cutoff_date)
+    }
+  }
+
+  out
+}
+
+gps_grouped_final <- gps_grouped |>
+  left_join(manual_cutoffs, by = c("farm", "animal_id")) |>
+  mutate(
+    data = pmap(list(data, keep_set, cutoff_type, cutoff_date), apply_manual_cutoff)
+  ) |>
+  select(farm, animal_id, data)
+
+  keep_list <- list(
+  FG = c(5, 581, 622),
+  IM = c(1125, 1204),
+  OS = c(109, 167, 228, 232, 263, 33, 341, 494, 599, 610, 675, 705, 72),
+  WL = c(1152, 1187, 1276, 1416, 1438, 1440, 1474, 1550, 1679, 1680)
+) ## filters based on animal ID, slightly different function to the manual_cutoffs because WL 1679 and 1680 had full observations and therefore nothing was cut
+ 
+keep_df <- imap_dfr(keep_list, \(ids, farm_key) {
+  tibble(farm = farm_key, animal_id = as.character(ids))
+})
+ 
+gps_grouped_final <- gps_grouped_final |>
+  mutate(animal_id = as.character(animal_id)) |>
+  semi_join(keep_df, by = c("farm", "animal_id"))
+
